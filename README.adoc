@@ -1,0 +1,432 @@
+= Compose Updater
+:toc:
+:toc-placement!:
+:toclevels: 3
+
+A Bash script for automatically updating Docker Compose applications across LXC containers on Proxmox hosts.
+
+toc::[]
+
+== Overview
+
+`compose_updater.sh` is a maintenance automation tool designed for Proxmox environments. It discovers running LXC containers, checks for Docker Compose applications within them, and intelligently updates those applications by pulling the latest container images and restarting services when updates are available.
+
+=== Key Features
+
+* *Automatic Discovery*: Finds all running LXC containers automatically
+* *Smart Updates*: Only restarts services when new images are actually pulled
+* *Safe Operation*: Dry-run mode for testing without making changes
+* *Colored Logging*: Clear, color-coded output for easy monitoring
+* *Resource Cleanup*: Automatically prunes unused Docker resources after updates
+* *Error Handling*: Strict error checking with `set -euo pipefail`
+
+== Requirements
+
+=== System Requirements
+
+* Proxmox VE host with LXC support
+* LXC tools (`lxc-ls`, `lxc-attach`)
+* Bash 4.0 or higher
+
+=== Container Requirements
+
+* Running LXC containers
+* Docker and Docker Compose installed in containers
+* `docker-compose.yml` file located at `/root/docker-compose.yml`
+
+== Installation
+
+. Clone or download the script to your Proxmox host:
++
+[source,bash]
+----
+git clone <repository-url> /opt/compose_updater
+cd /opt/compose_updater
+----
+
+. Make the script executable:
++
+[source,bash]
+----
+chmod +x compose_updater.sh
+----
+
+. (Optional) Create a symbolic link for easy access:
++
+[source,bash]
+----
+ln -s /opt/compose_updater/compose_updater.sh /usr/local/bin/compose_updater
+----
+
+== Usage
+
+=== Basic Usage
+
+Run the script with default settings:
+
+[source,bash]
+----
+./compose_updater.sh
+----
+
+=== Dry-Run Mode
+
+Test the script without making any changes:
+
+[source,bash]
+----
+./compose_updater.sh --dry-run
+----
+
+Dry-run mode will:
+
+* Show which containers would be processed
+* Display what commands would be executed
+* Report potential actions without modifying any containers
+
+=== Command-Line Options
+
+[cols="1,3"]
+|===
+|Option |Description
+
+|`--dry-run`
+|Run in simulation mode without making changes
+
+|===
+
+== How It Works
+
+=== Workflow
+
+The script follows this process for each running LXC container:
+
+1. *Discovery Phase*
+   - Lists all running LXC containers using `lxc-ls --running`
+   - Skips if no containers are running
+
+2. *Validation Phase*
+   - Checks if `/root/docker-compose.yml` exists in the container
+   - Skips containers without Docker Compose files
+
+3. *Update Phase*
+   - Runs `docker compose pull` to fetch latest images
+   - Analyzes output to detect if new images were pulled
+   - If new images detected:
+     * Runs `docker compose down` to stop services
+     * Runs `docker compose up -d` to start with new images
+     * Runs `docker system prune -f` to clean up old images
+   - If no new images:
+     * Skips restart to avoid unnecessary downtime
+
+4. *Cleanup Phase*
+   - Reports completion status for each container
+
+=== Detection Logic
+
+The script determines if updates are needed by analyzing `docker compose pull` output for these indicators:
+
+* "Pulled" - indicates a new layer was downloaded
+* "Downloaded newer image" - indicates a complete new image
+
+If neither string is found, the script assumes images are up-to-date and skips the restart.
+
+== Example Output
+
+=== Successful Update
+
+[source]
+----
+[INFO] Running in DRY-RUN mode - no changes will be made
+
+[INFO] Finding running LXC containers...
+[INFO] Found running containers: nginx-proxy monitoring database
+
+[INFO] Processing container: nginx-proxy
+[INFO] Container nginx-proxy: Found docker-compose.yml
+[INFO] Container nginx-proxy: Pulling latest images...
+[INFO] Container nginx-proxy: New images detected, updating services...
+[INFO] Container nginx-proxy: Stopping services...
+[INFO] Container nginx-proxy: Starting services...
+[INFO] Container nginx-proxy: Cleaning up unused Docker resources...
+[INFO] Container nginx-proxy: Update complete
+
+[INFO] Processing container: monitoring
+[WARN] Container monitoring: No /root/docker-compose.yml found, skipping
+
+[INFO] Processing container: database
+[INFO] Container database: Found docker-compose.yml
+[INFO] Container database: Pulling latest images...
+[INFO] Container database: No new images available, skipping update
+
+[INFO] All containers processed
+----
+
+=== Dry-Run Output
+
+[source]
+----
+[DRY-RUN] Running in DRY-RUN mode - no changes will be made
+
+[INFO] Finding running LXC containers...
+[INFO] Found running containers: nginx-proxy
+
+[INFO] Processing container: nginx-proxy
+[INFO] Container nginx-proxy: Found docker-compose.yml
+[DRY-RUN] Container nginx-proxy: Would run: docker compose pull
+[DRY-RUN] Container nginx-proxy: Simulating image check...
+[DRY-RUN] Container nginx-proxy: Would check if new images were pulled
+[DRY-RUN] Container nginx-proxy: If new images found, would run: docker compose down
+[DRY-RUN] Container nginx-proxy: If new images found, would run: docker compose up -d
+[DRY-RUN] Container nginx-proxy: If new images found, would run: docker system prune -f
+
+[INFO] All containers processed
+----
+
+== Automation
+
+=== Cron Job Setup
+
+To run updates automatically, create a cron job on your Proxmox host:
+
+[source,bash]
+----
+# Edit root's crontab
+crontab -e
+
+# Add one of these lines:
+
+# Run daily at 3 AM
+0 3 * * * /opt/compose_updater/compose_updater.sh >> /var/log/compose_updater.log 2>&1
+
+# Run weekly on Sunday at 2 AM
+0 2 * * 0 /opt/compose_updater/compose_updater.sh >> /var/log/compose_updater.log 2>&1
+----
+
+=== Systemd Timer
+
+Create a systemd service and timer for more advanced scheduling:
+
+.`/etc/systemd/system/compose_updater.service`
+[source,ini]
+----
+[Unit]
+Description=Update Docker Compose applications in LXC containers
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/compose_updater/compose_updater.sh
+StandardOutput=journal
+StandardError=journal
+----
+
+.`/etc/systemd/system/compose_updater.timer`
+[source,ini]
+----
+[Unit]
+Description=Run Compose Updater daily
+
+[Timer]
+OnCalendar=daily
+OnCalendar=03:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+----
+
+Enable and start the timer:
+
+[source,bash]
+----
+systemctl daemon-reload
+systemctl enable compose_updater.timer
+systemctl start compose_updater.timer
+
+# Check timer status
+systemctl list-timers compose_updater.timer
+----
+
+== Logging
+
+=== Log Levels
+
+The script uses four log levels with color coding:
+
+[cols="1,1,3"]
+|===
+|Level |Color |Purpose
+
+|INFO
+|Green
+|Normal operation messages
+
+|WARN
+|Yellow
+|Non-critical issues (skipped containers)
+
+|ERROR
+|Red
+|Critical failures
+
+|DRY-RUN
+|Blue
+|Simulated actions in dry-run mode
+
+|===
+
+=== Capturing Logs
+
+Redirect output to a log file:
+
+[source,bash]
+----
+./compose_updater.sh >> /var/log/compose_updater.log 2>&1
+----
+
+For colored output in log files:
+
+[source,bash]
+----
+./compose_updater.sh 2>&1 | tee /var/log/compose_updater.log
+----
+
+== Troubleshooting
+
+=== Common Issues
+
+==== No running containers found
+
+*Symptom*: `[WARN] No running LXC containers found`
+
+*Solutions*:
+
+* Verify containers are running: `lxc-ls --running`
+* Start containers if needed: `lxc-start -n <container-name>`
+
+==== Permission denied
+
+*Symptom*: Permission errors when running the script
+
+*Solutions*:
+
+* Run as root: `sudo ./compose_updater.sh`
+* Check script permissions: `ls -l compose_updater.sh`
+
+==== LXC commands not found
+
+*Symptom*: `lxc-ls: command not found`
+
+*Solutions*:
+
+* Install LXC tools: `apt-get install lxc`
+* Verify you're on a Proxmox/LXC host
+
+==== Docker Compose file not found
+
+*Symptom*: `[WARN] Container X: No /root/docker-compose.yml found, skipping`
+
+*Solutions*:
+
+* Move your compose file to `/root/docker-compose.yml`
+* Or modify line 70 of the script to check a different path
+
+==== Services not restarting
+
+*Symptom*: No errors, but services aren't updated
+
+*Solutions*:
+
+* Check if images actually have updates available
+* Review the pull output manually: `docker compose pull` in the container
+* Verify the detection logic is matching your Docker Compose output format
+
+== Customization
+
+=== Changing the Compose File Location
+
+Edit line 70 to check a different path:
+
+[source,bash]
+----
+# Original
+if ! lxc-attach -n "$container" -- test -f /root/docker-compose.yml; then
+
+# Custom path
+if ! lxc-attach -n "$container" -- test -f /opt/myapp/docker-compose.yml; then
+----
+
+Also update lines 88, 97, and 101 to use the same path.
+
+=== Filtering Containers
+
+To only update specific containers, add a filter after line 66:
+
+[source,bash]
+----
+for container in $running_containers; do
+    # Skip containers that don't match pattern
+    if [[ ! "$container" =~ ^(web|database|cache) ]]; then
+        continue
+    fi
+
+    log_info "Processing container: $container"
+    # ... rest of the code
+----
+
+=== Custom Update Commands
+
+Modify the update sequence (lines 96-105) for custom behavior:
+
+[source,bash]
+----
+# Example: Add backup before update
+log_info "Container $container: Creating backup..."
+lxc-attach -n "$container" -- sh -c 'cd /root && docker compose exec db backup.sh'
+
+# Stop the compose services
+log_info "Container $container: Stopping services..."
+lxc-attach -n "$container" -- sh -c 'cd /root && docker compose down'
+
+# ... continue with normal update
+----
+
+== Security Considerations
+
+* *Root Access*: Script requires root access to Proxmox host and LXC containers
+* *Automatic Restarts*: Services will restart without confirmation when updates are found
+* *Network Access*: Containers must have network access to pull images
+* *Backup Strategy*: Consider backing up data before automated updates
+* *Testing*: Always use `--dry-run` first when testing configuration changes
+
+== Best Practices
+
+1. *Test First*: Always run with `--dry-run` before live updates
+2. *Schedule Wisely*: Run during low-traffic periods
+3. *Monitor Logs*: Review logs regularly for issues
+4. *Backup Data*: Ensure containers have proper backup procedures
+5. *Staged Rollouts*: Test updates on non-critical containers first
+6. *Version Pinning*: Consider pinning critical service versions in compose files
+
+== License
+
+[Add your license information here]
+
+== Contributing
+
+[Add contribution guidelines here]
+
+== Support
+
+[Add support/contact information here]
+
+== Changelog
+
+=== Version 1.0.0 (Initial Release)
+
+* Automatic discovery of running LXC containers
+* Smart update detection based on image pull output
+* Dry-run mode for safe testing
+* Colored logging output
+* Automatic resource cleanup
