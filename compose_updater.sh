@@ -87,9 +87,12 @@ for container in $running_containers; do
         log_info "Container $container: Pulling latest images..."
         pull_output=$(lxc-attach -n "$container" -- sh -c 'cd /root && docker compose pull' 2>&1)
 
+        echo "$pull_output" | sed 's/^/  /'
+
         # Check if any new images were pulled
         # Docker Compose outputs "Pulled" or "Downloaded" when new images are fetched
-        if echo "$pull_output" | grep -qE "(Pulled|Downloaded newer image)"; then
+        # When no updates: outputs contain "Image is up to date" or just service names with no pull activity
+        if echo "$pull_output" | grep -qiE "(Pulled|Downloaded newer image|Downloaded|Downloading)"; then
             log_info "Container $container: New images detected, updating services..."
 
             # Stop the compose services
