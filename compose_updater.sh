@@ -90,9 +90,9 @@ for container in $running_containers; do
         echo "$pull_output" | sed 's/^/  /'
 
         # Check if any new images were pulled
-        # Docker Compose outputs "Pulled" or "Downloaded" when new images are fetched
-        # When no updates: outputs contain "Image is up to date" or just service names with no pull activity
-        if echo "$pull_output" | grep -qiE "(Pulled|Downloaded newer image|Downloaded|Downloading)"; then
+        # Docker Compose outputs "Downloading" when actually fetching new image layers
+        # When no updates: only shows "Pulling" and "Pulled" without any download activity
+        if echo "$pull_output" | grep -qiE "(Downloading|Downloaded newer image|Download complete)"; then
             log_info "Container $container: New images detected, updating services..."
 
             # Stop the compose services
