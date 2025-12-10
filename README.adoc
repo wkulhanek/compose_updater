@@ -78,6 +78,55 @@ Test the script without making any changes:
 ./compose_updater.sh --dry-run
 ----
 
+=== Custom Compose Path
+
+Specify a custom path for compose files:
+
+[source,bash]
+----
+./compose_updater.sh --compose-path /opt/myapp
+----
+
+=== Custom Compose Files
+
+Specify which compose file names to look for:
+
+[source,bash]
+----
+./compose_updater.sh --compose-files docker-compose.prod.yml,compose.staging.yml
+----
+
+=== Container Filtering
+
+Only process containers matching a pattern:
+
+[source,bash]
+----
+./compose_updater.sh --filter "web|api|database"
+----
+
+=== Combined Options
+
+[source,bash]
+----
+./compose_updater.sh --dry-run --compose-path /opt/myapp --filter "production-.*"
+
+# With timestamps for better logging
+./compose_updater.sh --timestamp --filter "web|api"
+
+# Using hooks for custom actions
+./compose_updater.sh --pre-hook /opt/backup.sh --post-hook /opt/notify.sh
+
+# With health checks (default behavior)
+./compose_updater.sh --health-check-timeout 60 --health-check-retries 5
+
+# Disable health checks for faster updates
+./compose_updater.sh --no-health-check
+
+# Combined with other options
+./compose_updater.sh --dry-run --filter "production-.*" --pre-hook ./backup.sh --post-hook ./notify.sh
+----
+
 Dry-run mode will:
 
 * Show which containers would be processed
@@ -92,6 +141,45 @@ Dry-run mode will:
 
 |`--dry-run`
 |Run in simulation mode without making changes
+
+|`--compose-path PATH`
+|Set the path to look for compose files (default: /root)
+
+|`--compose-files FILES`
+|Comma-separated list of compose file names to check (default: docker-compose.yml,compose.yaml,docker-compose.yaml)
+
+|`--filter PATTERN`
+|Only process containers matching this regex pattern
+
+|`--help`
+|Show help message and exit
+
+|`--timestamp`
+|Add timestamps to log messages
+
+|`--pre-hook SCRIPT`
+|Run script before updates (passes container name as argument)
+
+|`--post-hook SCRIPT`
+|Run script after successful updates (passes container name as argument)
+
+|`--no-health-check`
+|Disable health checks after updates
+
+|`--health-check-timeout SEC`
+|Health check timeout in seconds (default: 30)
+
+|`--health-check-retries N`
+|Number of health check retries (default: 3)
+
+|`--notify-email ADDR`
+|Send email notification to specified address
+
+|`--notify-webhook URL`
+|Send webhook notification to specified URL
+
+|`--notify-summary-only`
+|Only send summary notification (not per-container)
 
 |===
 
@@ -122,6 +210,12 @@ The script follows this process for each running LXC container:
 4. *Cleanup Phase*
    - Reports completion status for each container
 
+5. *Health Check Phase* (when enabled)
+   - Verifies services are running after updates
+   - Performs multiple retries if services are slow to start
+   - Continues to next container if health check fails
+   - Logs detailed health check results
+
 === Detection Logic
 
 The script determines if updates are needed by analyzing `docker compose pull` output for these indicators:
@@ -130,6 +224,411 @@ The script determines if updates are needed by analyzing `docker compose pull` o
 * "Downloaded newer image" - indicates a complete new image
 
 If neither string is found, the script assumes images are up-to-date and skips the restart.
+
+=== Multiple Compose Files
+
+The script now supports multiple compose file names and paths:
+
+* Checks for multiple file names by default: `docker-compose.yml`, `compose.yaml`, `docker-compose.yaml`
+* Can be customized with `--compose-files` option
+* Supports custom paths with `--compose-path` option
+* Processes the first found compose file in the specified order
+
+=== Container Filtering
+
+The `--filter` option allows selective processing of containers:
+
+* Uses regex pattern matching
+* Only processes containers that match the pattern
+* Useful for targeting specific container groups
+* Examples: `--filter "web-.*"`, `--filter "prod|staging"`
+
+=== Enhanced Error Handling
+
+The script now includes robust error handling:
+
+* Graceful handling of failed LXC commands
+* Detailed error messages with context
+* Continues processing other containers after failures
+* Error-specific logging to stderr
+* Automatic detection of missing dependencies
+
+=== Improved Logging
+
+New logging features provide better visibility:
+
+* Optional timestamps with `--timestamp` flag
+* Color-coded log levels (INFO, WARN, ERROR, DRY-RUN, SUCCESS, DEBUG)
+* Structured log format for easier parsing
+* Error messages sent to stderr
+* Success messages for completed operations
+
+=== Log Levels
+
+[cols="1,1,3"]
+|===
+|Level |Color |Purpose
+
+|INFO
+|Green
+|Normal operation messages
+
+|WARN
+|Yellow
+|Non-critical issues and warnings
+
+|ERROR
+|Red
+|Critical failures and error conditions
+
+|DRY-RUN
+|Blue
+|Simulated actions in dry-run mode
+
+|SUCCESS
+|Green
+|Successful completion of operations
+
+|DEBUG
+|Purple
+|Detailed debugging information
+
+|===
+
+=== Pre-Update and Post-Update Hooks
+
+The script supports custom hooks for running scripts before and after updates:
+
+=== Hook Execution
+
+* *Pre-Update Hook*: Runs before pulling images, receives container name as argument
+* *Post-Update Hook*: Runs after successful update, receives container name as argument
+* *Dry-Run Mode*: Shows what hooks would be executed without running them
+* *Error Handling*: Hook failures are logged but don't stop the update process
+
+=== Hook Use Cases
+
+* *Backup*: Run database backups before updates
+* *Notification*: Send alerts when updates complete
+* *Health Checks*: Verify service health after updates
+* *Logging*: Custom logging to external systems
+* *Monitoring*: Update monitoring systems with maintenance windows
+
+=== Hook Script Requirements
+
+* Must be executable (`chmod +x script.sh`)
+* Should accept container name as first argument
+* Return exit code 0 for success, non-zero for failure
+* Failure doesn't stop the update process (logged as warning)
+
+=== Example Hook Scripts
+
+.Backup script example (`backup.sh`):
+[source,bash]
+----
+#!/bin/bash
+CONTAINER_NAME="$1"
+BACKUP_DIR="/backups/$CONTAINER_NAME"
+DATE=$(date +%Y-%m-%d_%H-%M-%S)
+
+mkdir -p "$BACKUP_DIR"
+echo "Backing up $CONTAINER_NAME to $BACKUP_DIR/backup_$DATE.tar.gz"
+
+# Example: Backup database or important files
+# lxc-attach -n "$CONTAINER_NAME" -- tar czf /host/backups/backup_$DATE.tar.gz /important/data
+
+echo "Backup completed for $CONTAINER_NAME"
+----
+
+.Notification script example (`notify.sh`):
+[source,bash]
+----
+#!/bin/bash
+CONTAINER_NAME="$1"
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+
+# Example: Send notification via webhook
+MESSAGE="Container $CONTAINER_NAME updated successfully at $TIMESTAMP"
+
+# curl -X POST -H "Content-Type: application/json" -d "{\"message\": \"$MESSAGE\"}" https://webhook.example.com/alert
+
+echo "Notification sent for $CONTAINER_NAME"
+----
+
+=== Hook Best Practices
+
+1. *Keep hooks fast*: Avoid long-running operations that delay updates
+2. *Handle errors gracefully*: Hook failures shouldn't break the update process
+3. *Log hook activity*: Use the logging functions for visibility
+4. *Test hooks in dry-run*: Verify hook behavior before live execution
+5. *Make hooks idempotent*: Ensure hooks can run multiple times safely
+6. *Document hook purpose*: Add comments explaining what each hook does
+
+=== Health Check Verification
+
+The script includes automatic health check verification after successful updates:
+
+=== Health Check Features
+
+* *Automatic Verification*: Enabled by default with `--no-health-check` to disable
+* *Configurable Timeout*: Adjustable timeout period for service startup
+* *Multiple Retries*: Configurable number of retry attempts
+* *Detailed Logging*: Clear status messages for each health check attempt
+* *Graceful Failure*: Continues processing other containers if health check fails
+
+=== Health Check Process
+
+1. *Service Status Check*: Verifies containers are in "Running" state
+2. *Health Status Verification*: Checks Docker health status if defined
+3. *Retry Logic*: Waits and retries if services are slow to start
+4. *Success/Failure Reporting*: Clear logging of health check results
+5. *Timeout Handling*: Respects configured timeout to prevent hanging
+
+=== Health Check Configuration
+
+[cols="1,2,1"]
+|===
+|Option |Description |Default
+
+|`--no-health-check`
+|Disable health checks entirely
+|Enabled
+
+|`--health-check-timeout SEC`
+|Maximum time to wait for service startup per attempt
+|30 seconds
+
+|`--health-check-retries N`
+|Number of attempts to verify service health
+|3 attempts
+
+|===
+
+=== Health Check Use Cases
+
+* *Production Environments*: Verify critical services are healthy before considering update complete
+* *Development Testing*: Ensure new container versions start correctly
+* *CI/CD Pipelines*: Add verification step to deployment processes
+* *Monitoring Integration*: Health check results can trigger alerts via post-update hooks
+* *Slow-Starting Services*: Adjust timeout for services that take longer to initialize
+
+=== Health Check Best Practices
+
+1. *Adjust timeout for slow services*: Increase `--health-check-timeout` for services like databases
+2. *Balance retries and speed*: More retries increase reliability but slow down the process
+3. *Monitor health check failures*: Use post-update hooks to notify about failed health checks
+4. *Test health checks in dry-run*: Verify health check behavior before live execution
+5. *Consider disabling for non-critical updates*: Use `--no-health-check` for faster updates when appropriate
+6. *Combine with hooks*: Use pre-update hooks for backups and post-update hooks for notifications about health status
+
+=== Health Check Examples
+
+[source,bash]
+----
+# Default health check (enabled, 30s timeout, 3 retries)
+./compose_updater.sh
+
+# Custom health check settings for slow services
+./compose_updater.sh --health-check-timeout 120 --health-check-retries 5
+
+# Disable health checks for faster updates (not recommended for production)
+./compose_updater.sh --no-health-check
+
+# Health checks with other options
+./compose_updater.sh --filter "production-.*" --health-check-timeout 60
+
+# With notifications
+./compose_updater.sh --notify-email admin@example.com --notify-webhook https://webhook.example.com/alert
+
+# Dry-run to test health check behavior
+./compose_updater.sh --dry-run --health-check-timeout 30 --health-check-retries 3
+
+# Complete example with all features
+./compose_updater.sh --filter "production-.*" --pre-hook ./backup.sh --health-check-timeout 60 --notify-email team@example.com
+----
+
+=== Health Check Troubleshooting
+
+==== Health check fails but services are running
+
+*Symptom*: Health check reports failure but `docker compose ps` shows running containers
+
+*Solutions*:
+
+* Check if containers have health checks defined in compose file
+* Increase timeout with `--health-check-timeout`
+* Check container logs for startup errors
+* Verify health check command in compose file is correct
+
+==== Health check times out
+
+*Symptom*: Health check reaches maximum retries without success
+
+*Solutions*:
+
+* Increase timeout with `--health-check-timeout 60` or higher
+* Increase retries with `--health-check-retries 5`
+* Check if services are actually starting (may need resource adjustments)
+* Review service dependencies and startup order
+
+==== Health check slows down updates
+
+*Symptom*: Update process takes much longer due to health checks
+
+*Solutions*:
+
+* Reduce retries with `--health-check-retries 2`
+* Use shorter timeout with `--health-check-timeout 15`
+* Disable for non-critical containers using filtering
+* Consider `--no-health-check` for development environments
+
+=== Notification System
+
+The script includes a built-in notification system to alert about update results:
+
+=== Notification Features
+
+* *Multiple Methods*: Email and webhook notifications supported
+* *Detailed Summary*: Comprehensive report of update results
+* *Success/Failure Detection*: Different notifications for successful vs failed updates
+* *Timing Information*: Start/end times and duration included
+* *Container Tracking*: Lists updated, failed, and skipped containers
+
+=== Notification Methods
+
+[cols="1,2,2"]
+|===
+|Method |Requirements |Use Case
+
+|Email
+|`mail` command installed
+|Traditional email alerts to administrators
+
+|Webhook
+|`curl` command installed
+|Integration with Slack, Discord, monitoring systems
+
+|===
+
+=== Notification Configuration
+
+[cols="1,2,1"]
+|===
+|Option |Description |Default
+
+|`--notify-email ADDR`
+|Send email notification to specified address
+|Disabled
+
+|`--notify-webhook URL`
+|Send webhook notification to specified URL
+|Disabled
+
+|`--notify-summary-only`
+|Only send summary notification (future expansion)
+|Disabled
+
+|===
+
+=== Notification Content
+
+The notification includes:
+
+* *Timing Information*: Start time, end time, and total duration
+* *Update Summary*: Counts of updated, failed, and skipped containers
+* *Detailed Lists*: Container names in each category
+* *Status Indicator*: Success/failure in subject and message
+* *Formatting*: Clear, readable format for easy parsing
+
+=== Notification Examples
+
+[source,bash]
+----
+# Email notification only
+./compose_updater.sh --notify-email admin@example.com
+
+# Webhook notification only
+./compose_updater.sh --notify-webhook https://slack-webhook.example.com/alerts
+
+# Both email and webhook
+./compose_updater.sh --notify-email team@example.com --notify-webhook https://webhook.example.com
+
+# With other options
+./compose_updater.sh --filter "production-.*" --notify-email ops@example.com --health-check-timeout 60
+----
+
+=== Notification Use Cases
+
+* *Production Monitoring*: Alert operations team about update results
+* *CI/CD Integration*: Notify build systems about deployment status
+* *Team Communication*: Send updates to team channels (Slack, Teams, etc.)
+* *Audit Trail*: Maintain records of update activities
+* *Incident Response*: Quick alerts for failed updates
+* *Compliance Reporting*: Documentation of maintenance activities
+
+=== Notification Best Practices
+
+1. *Use multiple methods*: Combine email and webhook for redundancy
+2. *Monitor notification delivery*: Ensure alerts are actually received
+3. *Adjust for environment*: Use different recipients for dev vs production
+4. *Balance frequency*: Avoid notification fatigue with appropriate filtering
+5. *Secure sensitive data*: Don't include sensitive information in notifications
+6. *Test notifications*: Verify notification setup with dry-run mode
+
+=== Notification Troubleshooting
+
+==== Notifications not sent
+
+*Symptom*: No notifications received after update completion
+
+*Solutions*:
+
+* Verify email/webhook addresses are correct
+* Check if `mail` or `curl` commands are installed
+* Test with dry-run mode to see notification logging
+* Check spam folders for email notifications
+* Verify webhook URL is accessible
+
+==== Email notifications fail
+
+*Symptom*: Email notifications not delivered
+
+*Solutions*:
+
+* Check if `mail` command is installed (`apt install mailutils`)
+* Verify SMTP server configuration
+* Test email delivery manually
+* Check system mail logs for errors
+
+==== Webhook notifications fail
+
+*Symptom*: Webhook notifications not received
+
+*Solutions*:
+
+* Verify webhook URL is correct and accessible
+* Check if `curl` is installed
+* Test webhook manually with curl
+* Check webhook endpoint logs
+* Verify JSON payload format is expected
+
+=== Example Notification Payload
+
+[source,json]
+----
+{
+  "message": "Compose Updater Update Summary\n\nStart Time: 2023-12-10 14:30:45\nEnd Time: 2023-12-10 14:35:22\nDuration: 277 seconds\n\nUpdated Containers: 3\n  - web-server\n  - database\n  - cache\n\nFailed Containers: 1\n  - monitoring\n\nSkipped Containers: 2\n  - staging-web\n  - test-db\n\n⚠️  WARNING: Some containers failed during update process",
+  "timestamp": "2023-12-10T14:35:22Z"
+}
+----
+
+=== Notification Security Considerations
+
+* *Sensitive Data*: Avoid including passwords or sensitive info in notifications
+* *Authentication*: Use secure webhook URLs with authentication if needed
+* *Encryption*: Ensure email/webhook endpoints use HTTPS/SSL
+* *Rate Limiting*: Be aware of notification rate limits on webhook services
+* *Recipient Control*: Only send notifications to authorized personnel
 
 == Example Output
 
@@ -346,33 +845,32 @@ For colored output in log files:
 
 === Changing the Compose File Location
 
-Edit line 70 to check a different path:
+The new version supports multiple compose files and custom paths via command line options:
 
 [source,bash]
 ----
-# Original
-if ! lxc-attach -n "$container" -- test -f /root/docker-compose.yml; then
+# Use command line options instead of editing the script
+./compose_updater.sh --compose-path /opt/myapp --compose-files docker-compose.prod.yml
 
-# Custom path
-if ! lxc-attach -n "$container" -- test -f /opt/myapp/docker-compose.yml; then
+# Or set defaults by modifying these variables at the top of the script:
+COMPOSE_FILES=("docker-compose.yml" "compose.yaml" "docker-compose.yaml")
+COMPOSE_PATH="/root"
 ----
-
-Also update lines 88, 97, and 101 to use the same path.
 
 === Filtering Containers
 
-To only update specific containers, add a filter after line 66:
+Use the `--filter` command line option for container selection:
 
 [source,bash]
 ----
-for container in $running_containers; do
-    # Skip containers that don't match pattern
-    if [[ ! "$container" =~ ^(web|database|cache) ]]; then
-        continue
-    fi
+# Only process containers matching the pattern
+./compose_updater.sh --filter "web|database|cache"
 
-    log_info "Processing container: $container"
-    # ... rest of the code
+# Use regex patterns for more complex matching
+./compose_updater.sh --filter "^prod-.*"
+
+# Combine with other options
+./compose_updater.sh --dry-run --filter "api|web" --compose-path /opt/services
 ----
 
 === Custom Update Commands
