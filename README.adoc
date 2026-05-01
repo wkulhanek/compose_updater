@@ -19,6 +19,10 @@ toc::[]
 * *Colored Logging*: Clear, color-coded output for easy monitoring
 * *Resource Cleanup*: Automatically prunes unused Docker resources after updates
 * *Error Handling*: Strict error checking with `set -euo pipefail`
+* *Concurrent Run Prevention*: Lock file prevents overlapping executions
+* *Hook Validation*: Pre/post hooks are validated for existence and executability before execution
+* *Input Validation*: Timeout and retry parameters are validated as positive integers
+* *Webhook Security*: JSON payloads are safely encoded (via `jq` or manual escaping)
 
 == Requirements
 
@@ -114,7 +118,7 @@ Only process containers matching a pattern:
 # With timestamps for better logging
 ./compose_updater.sh --timestamp --filter "web|api"
 
-# Using hooks for custom actions
+# Using hooks (must exist and be executable on the host)
 ./compose_updater.sh --pre-hook /opt/backup.sh --post-hook /opt/notify.sh
 
 # With health checks (default behavior)
@@ -218,12 +222,12 @@ The script follows this process for each running LXC container:
 
 === Detection Logic
 
-The script determines if updates are needed by analyzing `docker compose pull` output for these indicators:
+The script determines if updates are needed by analyzing `docker compose pull` output for status lines:
 
-* "Pulled" - indicates a new layer was downloaded
-* "Downloaded newer image" - indicates a complete new image
+* `Status: Downloaded newer image` - indicates a complete image was pulled
+* `Status: Downloading` or `Status: Download complete` - indicates new layers were fetched
 
-If neither string is found, the script assumes images are up-to-date and skips the restart.
+If no status line matching these patterns is found, the script assumes images are up-to-date and skips the restart. This prevents false positives from unrelated log output.
 
 === Multiple Compose Files
 
@@ -316,10 +320,12 @@ The script supports custom hooks for running scripts before and after updates:
 
 === Hook Script Requirements
 
+* Must exist as a file at the specified path (invalid paths cause script to exit)
 * Must be executable (`chmod +x script.sh`)
 * Should accept container name as first argument
 * Return exit code 0 for success, non-zero for failure
 * Failure doesn't stop the update process (logged as warning)
+* Error output from hooks is visible (not suppressed)
 
 === Example Hook Scripts
 
@@ -379,7 +385,7 @@ The script includes automatic health check verification after successful updates
 === Health Check Process
 
 1. *Service Status Check*: Verifies containers are in "Running" state
-2. *Health Status Verification*: Checks Docker health status if defined
+2. *Health Status Verification*: Checks Docker health status if defined — distinguishes between `healthy`, `unhealthy`, and `starting`
 3. *Retry Logic*: Waits and retries if services are slow to start
 4. *Success/Failure Reporting*: Clear logging of health check results
 5. *Timeout Handling*: Respects configured timeout to prevent hanging
@@ -493,6 +499,7 @@ The script includes a built-in notification system to alert about update results
 * *Success/Failure Detection*: Different notifications for successful vs failed updates
 * *Timing Information*: Start/end times and duration included
 * *Container Tracking*: Lists updated, failed, and skipped containers
+* *Safe JSON Encoding*: Webhook payloads use `jq` when available, or manual escaping otherwise
 
 === Notification Methods
 
@@ -673,11 +680,10 @@ The notification includes:
 [INFO] Processing container: nginx-proxy
 [INFO] Container nginx-proxy: Found docker-compose.yml
 [DRY-RUN] Container nginx-proxy: Would run: docker compose pull
-[DRY-RUN] Container nginx-proxy: Simulating image check...
-[DRY-RUN] Container nginx-proxy: Would check if new images were pulled
-[DRY-RUN] Container nginx-proxy: If new images found, would run: docker compose down
-[DRY-RUN] Container nginx-proxy: If new images found, would run: docker compose up -d
-[DRY-RUN] Container nginx-proxy: If new images found, would run: docker system prune -f
+[DRY-RUN] Container nginx-proxy: Would analyze pull output for updates
+[DRY-RUN] Container nginx-proxy: If new images detected, would run: docker compose -f $found_compose_file down
+[DRY-RUN] Container nginx-proxy: If new images detected, would run: docker compose -f $found_compose_file up -d
+[DRY-RUN] Container nginx-proxy: If new images detected, would run: docker system prune -f
 
 [INFO] All containers processed
 ----
@@ -695,10 +701,10 @@ crontab -e
 
 # Add one of these lines:
 
-# Run daily at 3 AM
+# Run daily at 3 AM (lock file prevents overlapping runs)
 0 3 * * * /opt/compose_updater/compose_updater.sh >> /var/log/compose_updater.log 2>&1
 
-# Run weekly on Sunday at 2 AM
+# Run weekly on Sunday at 2 AM (lock file prevents overlapping runs)
 0 2 * * 0 /opt/compose_updater/compose_updater.sh >> /var/log/compose_updater.log 2>&1
 ----
 
@@ -829,7 +835,7 @@ For colored output in log files:
 *Solutions*:
 
 * Move your compose file to `/root/docker-compose.yml`
-* Or modify line 70 of the script to check a different path
+* Or use `--compose-path` to specify the correct directory
 
 ==== Services not restarting
 
@@ -840,6 +846,16 @@ For colored output in log files:
 * Check if images actually have updates available
 * Review the pull output manually: `docker compose pull` in the container
 * Verify the detection logic is matching your Docker Compose output format
+
+==== Hook file not found or not executable
+
+*Symptom*: Script exits with error about pre/post-hook file
+
+*Solutions*:
+
+* Ensure the hook file exists at the specified path
+* Make it executable: `chmod +x /path/to/hook.sh`
+* Verify the path is correct (including any subdirectories)
 
 == Customization
 
@@ -875,7 +891,7 @@ Use the `--filter` command line option for container selection:
 
 === Custom Update Commands
 
-Modify the update sequence (lines 96-105) for custom behavior:
+Modify the update sequence (lines 520-530) for custom behavior:
 
 [source,bash]
 ----
@@ -897,6 +913,9 @@ lxc-attach -n "$container" -- sh -c 'cd /root && docker compose down'
 * *Network Access*: Containers must have network access to pull images
 * *Backup Strategy*: Consider backing up data before automated updates
 * *Testing*: Always use `--dry-run` first when testing configuration changes
+* *Input Validation*: Timeout and retry values are validated as positive integers to prevent injection
+* *Webhook Safety*: JSON payloads are encoded safely to prevent injection via container names
+* *Hook Validation*: Hook scripts are validated for existence and executability before execution
 
 == Best Practices
 
@@ -920,6 +939,17 @@ lxc-attach -n "$container" -- sh -c 'cd /root && docker compose down'
 [Add support/contact information here]
 
 == Changelog
+
+=== Version 2.0.0
+
+* *Concurrent run prevention*: Lock file prevents overlapping executions
+* *Hook validation*: Pre/post hooks validated for existence and executability before execution
+* *Input validation*: Timeout and retry parameters validated as positive integers
+* *Webhook security*: JSON payloads safely encoded (via `jq` when available, or manual escaping)
+* *Health status value checking*: Properly distinguishes `healthy`, `unhealthy`, and `starting`
+* *Improved error output*: Hook output and LXC errors visible for debugging
+* *Tightened pull detection*: Matches only Docker compose status lines to avoid false positives
+* *Final notification function*: Moved into `send_final_notification()` for correctness
 
 === Version 1.0.0 (Initial Release)
 
