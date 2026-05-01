@@ -42,35 +42,52 @@ START_TIME=$(date +%s)
 
 # --- Utility functions ---
 
-# Returns a timestamp string if enabled, empty string otherwise
-get_timestamp() {
-    if [ "${LOG_WITH_TIMESTAMP:-false}" = true ]; then
-        printf '%s' "$(date '+%Y-%m-%d %H:%M:%S') "
-    fi
-}
-
 log_info() {
-    echo -e "${GREEN}${get_timestamp}[INFO]${NC} $1"
+    local ts=""
+    if [ "${LOG_WITH_TIMESTAMP:-false}" = true ]; then
+        ts="$(date '+%Y-%m-%d %H:%M:%S') "
+    fi
+    echo -e "${GREEN}${ts}[INFO]${NC} $1"
 }
 
 log_warn() {
-    echo -e "${YELLOW}${get_timestamp}[WARN]${NC} $1"
+    local ts=""
+    if [ "${LOG_WITH_TIMESTAMP:-false}" = true ]; then
+        ts="$(date '+%Y-%m-%d %H:%M:%S') "
+    fi
+    echo -e "${YELLOW}${ts}[WARN]${NC} $1"
 }
 
 log_error() {
-    echo -e "${RED}${get_timestamp}[ERROR]${NC} $1" >&2
+    local ts=""
+    if [ "${LOG_WITH_TIMESTAMP:-false}" = true ]; then
+        ts="$(date '+%Y-%m-%d %H:%M:%S') "
+    fi
+    echo -e "${RED}${ts}[ERROR]${NC} $1" >&2
 }
 
 log_dry_run() {
-    echo -e "${BLUE}${get_timestamp}[DRY-RUN]${NC} $1"
+    local ts=""
+    if [ "${LOG_WITH_TIMESTAMP:-false}" = true ]; then
+        ts="$(date '+%Y-%m-%d %H:%M:%S') "
+    fi
+    echo -e "${BLUE}${ts}[DRY-RUN]${NC} $1"
 }
 
 log_success() {
-    echo -e "${GREEN}${get_timestamp}[SUCCESS]${NC} $1"
+    local ts=""
+    if [ "${LOG_WITH_TIMESTAMP:-false}" = true ]; then
+        ts="$(date '+%Y-%m-%d %H:%M:%S') "
+    fi
+    echo -e "${GREEN}${ts}[SUCCESS]${NC} $1"
 }
 
 log_debug() {
-    echo -e "${PURPLE}${get_timestamp}[DEBUG]${NC} $1"
+    local ts=""
+    if [ "${LOG_WITH_TIMESTAMP:-false}" = true ]; then
+        ts="$(date '+%Y-%m-%d %H:%M:%S') "
+    fi
+    echo -e "${PURPLE}${ts}[DEBUG]${NC} $1"
 }
 
 # Validate that a value is a positive integer
