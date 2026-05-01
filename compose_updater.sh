@@ -31,11 +31,98 @@ NOTIFY_EMAIL=""
 NOTIFY_WEBHOOK=""
 NOTIFY_SUMMARY_ONLY=false
 
+# Lock file to prevent concurrent runs
+LOCKFILE="/tmp/compose_updater.lock"
+
 # Notification tracking
 declare -a UPDATED_CONTAINERS
 declare -a FAILED_CONTAINERS
 declare -a SKIPPED_CONTAINERS
 START_TIME=$(date +%s)
+
+# --- Utility functions ---
+
+log_info() {
+    local ts=""
+    if [ "${LOG_WITH_TIMESTAMP:-false}" = true ]; then
+        ts="$(date '+%Y-%m-%d %H:%M:%S') "
+    fi
+    echo -e "${GREEN}${ts}[INFO]${NC} $1"
+}
+
+log_warn() {
+    local ts=""
+    if [ "${LOG_WITH_TIMESTAMP:-false}" = true ]; then
+        ts="$(date '+%Y-%m-%d %H:%M:%S') "
+    fi
+    echo -e "${YELLOW}${ts}[WARN]${NC} $1"
+}
+
+log_error() {
+    local ts=""
+    if [ "${LOG_WITH_TIMESTAMP:-false}" = true ]; then
+        ts="$(date '+%Y-%m-%d %H:%M:%S') "
+    fi
+    echo -e "${RED}${ts}[ERROR]${NC} $1" >&2
+}
+
+log_dry_run() {
+    local ts=""
+    if [ "${LOG_WITH_TIMESTAMP:-false}" = true ]; then
+        ts="$(date '+%Y-%m-%d %H:%M:%S') "
+    fi
+    echo -e "${BLUE}${ts}[DRY-RUN]${NC} $1"
+}
+
+log_success() {
+    local ts=""
+    if [ "${LOG_WITH_TIMESTAMP:-false}" = true ]; then
+        ts="$(date '+%Y-%m-%d %H:%M:%S') "
+    fi
+    echo -e "${GREEN}${ts}[SUCCESS]${NC} $1"
+}
+
+log_debug() {
+    local ts=""
+    if [ "${LOG_WITH_TIMESTAMP:-false}" = true ]; then
+        ts="$(date '+%Y-%m-%d %H:%M:%S') "
+    fi
+    echo -e "${PURPLE}${ts}[DEBUG]${NC} $1"
+}
+
+# Validate that a value is a positive integer
+validate_positive_integer() {
+    local label="$1"
+    local value="$2"
+    
+    if [[ ! "$value" =~ ^[0-9]+$ ]] || [ "$value" -le 0 ]; then
+        log_error "$label must be a positive integer (got: '$value')"
+        exit 1
+    fi
+}
+
+# Safely expand arrays under set -u
+# Usage: array_length array_name [default=0]
+array_length() {
+    local name="$1"
+    local default="${2:-0}"
+    eval "echo \"\${#$name[@]:-$default}\""
+}
+
+# --- Helper: lock file to prevent concurrent runs ---
+
+acquire_lock() {
+    if [ -f "$LOCKFILE" ]; then
+        local existing_pid
+        existing_pid=$(cat "$LOCKFILE" 2>/dev/null || echo "unknown")
+        log_error "Another instance is already running (PID: $existing_pid). Remove $LOCKFILE if this is stale."
+        exit 1
+    fi
+    echo $$ > "$LOCKFILE"
+    trap 'rm -f "$LOCKFILE"' EXIT
+}
+
+# --- Parse command line arguments ---
 
 show_help() {
     echo "Usage: $0 [OPTIONS]"
@@ -63,7 +150,6 @@ show_help() {
     echo "  $0 --filter 'web|api'"
 }
 
-# Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
         --dry-run)
@@ -99,10 +185,12 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --health-check-timeout)
+            validate_positive_integer "Health check timeout" "$2"
             HEALTH_CHECK_TIMEOUT="$2"
             shift 2
             ;;
         --health-check-retries)
+            validate_positive_integer "Health check retries" "$2"
             HEALTH_CHECK_RETRIES="$2"
             shift 2
             ;;
@@ -123,78 +211,39 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         *)
-            echo "Unknown option: $1"
+            log_error "Unknown option: $1"
             echo "Usage: $0 [--dry-run] [--compose-path PATH] [--compose-files FILE1,FILE2,...] [--filter PATTERN] [--help]"
             exit 1
             ;;
     esac
 done
 
-log_info() {
-    local timestamp=""
-    if [ "$LOG_WITH_TIMESTAMP" = true ]; then
-        timestamp="$(date '+%Y-%m-%d %H:%M:%S') "
-    fi
-    echo -e "${GREEN}${timestamp}[INFO]${NC} $1"
-}
-
-log_warn() {
-    local timestamp=""
-    if [ "$LOG_WITH_TIMESTAMP" = true ]; then
-        timestamp="$(date '+%Y-%m-%d %H:%M:%S') "
-    fi
-    echo -e "${YELLOW}${timestamp}[WARN]${NC} $1"
-}
-
-log_error() {
-    local timestamp=""
-    if [ "$LOG_WITH_TIMESTAMP" = true ]; then
-        timestamp="$(date '+%Y-%m-%d %H:%M:%S') "
-    fi
-    echo -e "${RED}${timestamp}[ERROR]${NC} $1" >&2
-}
-
-log_dry_run() {
-    local timestamp=""
-    if [ "$LOG_WITH_TIMESTAMP" = true ]; then
-        timestamp="$(date '+%Y-%m-%d %H:%M:%S') "
-    fi
-    echo -e "${BLUE}${timestamp}[DRY-RUN]${NC} $1"
-}
-
-log_success() {
-    local timestamp=""
-    if [ "$LOG_WITH_TIMESTAMP" = true ]; then
-        timestamp="$(date '+%Y-%m-%d %H:%M:%S') "
-    fi
-    echo -e "${GREEN}${timestamp}[SUCCESS]${NC} $1"
-}
-
-log_debug() {
-    local timestamp=""
-    if [ "$LOG_WITH_TIMESTAMP" = true ]; then
-        timestamp="$(date '+%Y-%m-%d %H:%M:%S') "
-    fi
-    echo -e "${PURPLE}${timestamp}[DEBUG]${NC} $1"
-}
-
-# Error handling function
-handle_error() {
-    local exit_code=$1
-    local message="$2"
-    local container="$3"
-    
-    if [ $exit_code -ne 0 ]; then
-        log_error "$message"
-        if [ -n "$container" ]; then
-            log_error "Failed while processing container: $container"
+# Validate hook paths before proceeding (only for live runs, not dry-run)
+if [ "$DRY_RUN" = false ]; then
+    if [ -n "$PRE_UPDATE_HOOK" ]; then
+        if [ ! -f "$PRE_UPDATE_HOOK" ]; then
+            log_error "Pre-update hook file not found: $PRE_UPDATE_HOOK"
+            exit 1
         fi
-        log_error "Script failed with exit code: $exit_code"
-        exit $exit_code
+        if [ ! -x "$PRE_UPDATE_HOOK" ]; then
+            log_error "Pre-update hook is not executable: $PRE_UPDATE_HOOK"
+            exit 1
+        fi
     fi
-}
+    if [ -n "$POST_UPDATE_HOOK" ]; then
+        if [ ! -f "$POST_UPDATE_HOOK" ]; then
+            log_error "Post-update hook file not found: $POST_UPDATE_HOOK"
+            exit 1
+        fi
+        if [ ! -x "$POST_UPDATE_HOOK" ]; then
+            log_error "Post-update hook is not executable: $POST_UPDATE_HOOK"
+            exit 1
+        fi
+    fi
+fi
 
-# Health check function
+# --- Health check function ---
+
 check_container_health() {
     local container="$1"
     local compose_file="$2"
@@ -213,16 +262,25 @@ check_container_health() {
         if lxc-attach -n "$container" -- sh -c "cd $COMPOSE_PATH && docker compose -f $compose_file ps --format json" 2>/dev/null | grep -q '"Running"'; then
             log_info "Container $container: Services are running"
             
-            # Check for healthy status if health checks are defined
-            local health_status=$(lxc-attach -n "$container" -- sh -c "cd $COMPOSE_PATH && timeout $timeout docker compose -f $compose_file ps --format json" 2>/dev/null | grep -o '"Health"[^,]*')
+            # Check for healthy status if health checks are defined in the compose file
+            local raw_health
+            raw_health=$(lxc-attach -n "$container" -- sh -c "cd $COMPOSE_PATH && timeout $timeout docker compose -f $compose_file ps --format json" 2>/dev/null | grep -o '"Health":"[^"]*"' || true)
             
-            if [ -z "$health_status" ] || echo "$health_status" | grep -q '"Health"'; then
-                # If no health check defined or health check exists, consider healthy
-                healthy=true
-                log_success "Container $container: Health check passed"
-                break
+            if [ -n "$raw_health" ]; then
+                # Extract the health status value (e.g., "healthy", "unhealthy")
+                local status_value
+                status_value=$(echo "$raw_health" | sed 's/"Health":"\([^"]*\)"/\1/')
+                
+                if [ "$status_value" = "healthy" ]; then
+                    log_success "Container $container: Health check passed (status: $status_value)"
+                    healthy=true
+                    break
+                else
+                    log_warn "Container $container: Health check reports status: $status_value"
+                fi
             else
-                log_warn "Container $container: Health check not defined, but services are running"
+                # No health check defined in compose file — consider it healthy if running
+                log_info "Container $container: No health check defined, but services are running"
                 healthy=true
                 break
             fi
@@ -244,7 +302,8 @@ check_container_health() {
     return 0
 }
 
-# Notification functions
+# --- Notification functions ---
+
 send_email_notification() {
     local subject="$1"
     local message="$2"
@@ -270,6 +329,12 @@ send_email_notification() {
     return 0
 }
 
+# Safely build JSON by escaping special characters in a string
+# Produces JSON-safe string: escapes backslashes, quotes, and newlines
+json_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/$//' | tr '\n' ' '
+}
+
 send_webhook_notification() {
     local message="$1"
     
@@ -281,13 +346,30 @@ send_webhook_notification() {
     
     # Use curl if available, otherwise log that webhook would be sent
     if command -v curl >/dev/null 2>&1; then
-        curl -X POST -H "Content-Type: application/json" -d "{\"message\": \"$message\", \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" "$NOTIFY_WEBHOOK" 2>/dev/null || {
+        # Build JSON payload using jq if available for safe encoding, otherwise escape manually
+        local json_payload
+        if command -v jq >/dev/null 2>&1; then
+            json_payload=$(jq -n \
+                --arg msg "$message" \
+                --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                '{"message": $msg, "timestamp": $ts}')
+        else
+            local escaped_msg escaped_ts
+            escaped_msg=$(json_escape "$message")
+            escaped_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            json_payload="{\"message\": \"$escaped_msg\", \"timestamp\": \"$escaped_ts\"}"
+        fi
+        
+        curl -sf -X POST -H "Content-Type: application/json" -d "$json_payload" "$NOTIFY_WEBHOOK" 2>/dev/null || {
             log_warn "Failed to send webhook notification"
+            log_debug "Webhook payload: $json_payload"
             return 1
         }
     else
         log_warn "curl command not available, webhook notification would be sent to: $NOTIFY_WEBHOOK"
-        log_info "Webhook Payload: {\"message\": \"$message\", \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+        local escaped_msg
+        escaped_msg=$(json_escape "$message")
+        log_info "Webhook Payload: {\"message\": \"$escaped_msg\", \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
     fi
     
     return 0
@@ -301,15 +383,70 @@ send_notification() {
     send_webhook_notification "$message"
 }
 
+# --- Final notification (wrapped in function to avoid 'local' outside functions) ---
+
+send_final_notification() {
+    local subject="Compose Updater: Update Process Completed"
+    local message="Compose Updater Update Summary\n\n"
+    message+="Start Time: $(date -d @$START_TIME '+%Y-%m-%d %H:%M:%S')\n"
+    message+="End Time: $(date -d @$(date +%s) '+%Y-%m-%d %H:%M:%S')\n"
+    local duration
+    duration=$(( $(date +%s) - START_TIME ))
+    message+="Duration: ${duration} seconds\n\n"
+    
+    message+="Updated Containers: $(array_length UPDATED_CONTAINERS)\n"
+    if [ "$(array_length UPDATED_CONTAINERS)" -gt 0 ]; then
+        local uc
+        for uc in "${UPDATED_CONTAINERS[@]}"; do
+            message+="  - $uc\n"
+        done
+    fi
+    message+="\n"
+    
+    message+="Failed Containers: $(array_length FAILED_CONTAINERS)\n"
+    if [ "$(array_length FAILED_CONTAINERS)" -gt 0 ]; then
+        local fc
+        for fc in "${FAILED_CONTAINERS[@]}"; do
+            message+="  - $fc\n"
+        done
+    fi
+    message+="\n"
+    
+    message+="Skipped Containers: $(array_length SKIPPED_CONTAINERS)\n"
+    if [ "$(array_length SKIPPED_CONTAINERS)" -gt 0 ]; then
+        local sc
+        for sc in "${SKIPPED_CONTAINERS[@]}"; do
+            message+="  - $sc\n"
+        done
+    fi
+    
+    if [ "$(array_length FAILED_CONTAINERS)" -gt 0 ]; then
+        subject="Compose Updater: Update Process Completed with Failures"
+        message+="\n\n⚠️  WARNING: Some containers failed during update process"
+    else
+        message+="\n\n✅ All containers processed successfully"
+    fi
+    
+    send_notification "$subject" "$message"
+}
+
+# --- Main execution ---
+
 if [ "$DRY_RUN" = true ]; then
     log_dry_run "Running in DRY-RUN mode - no changes will be made"
     echo ""
 fi
 
-# Get list of running LXC containers
+# Acquire lock to prevent concurrent runs
+if [ "$DRY_RUN" = false ]; then
+    acquire_lock
+fi
+
+# Get list of running LXC containers — do NOT suppress stderr; report errors
 log_info "Finding running LXC containers..."
-if ! running_containers=$(lxc-ls --running 2>/dev/null); then
+if ! running_containers=$(lxc-ls --running 2>&1); then
     log_error "Failed to get list of running LXC containers. Is lxc-ls installed and are you running on a Proxmox host?"
+    log_error "Error output: $running_containers"
     exit 1
 fi
 
@@ -353,8 +490,8 @@ for container in $running_containers; do
     # Run pre-update hook if specified
     if [ -n "$PRE_UPDATE_HOOK" ] && [ "$DRY_RUN" = false ]; then
         log_info "Container $container: Running pre-update hook: $PRE_UPDATE_HOOK"
-        if ! "$PRE_UPDATE_HOOK" "$container" 2>/dev/null; then
-            log_warn "Container $container: Pre-update hook failed or returned non-zero"
+        if ! "$PRE_UPDATE_HOOK" "$container"; then
+            log_warn "Container $container: Pre-update hook returned non-zero exit code (output above)"
         fi
     elif [ -n "$PRE_UPDATE_HOOK" ] && [ "$DRY_RUN" = true ]; then
         log_dry_run "Container $container: Would run pre-update hook: $PRE_UPDATE_HOOK $container"
@@ -363,12 +500,10 @@ for container in $running_containers; do
     # Pull latest images and capture output
     if [ "$DRY_RUN" = true ]; then
         log_dry_run "Container $container: Would run: docker compose -f $found_compose_file pull"
-        log_dry_run "Container $container: Simulating image check..."
-        # In dry-run mode, simulate that new images might be available
-        log_dry_run "Container $container: Would check if new images were pulled"
-        log_dry_run "Container $container: If new images found, would run: docker compose -f $found_compose_file down"
-        log_dry_run "Container $container: If new images found, would run: docker compose -f $found_compose_file up -d"
-        log_dry_run "Container $container: If new images found, would run: docker system prune -f"
+        log_dry_run "Container $container: Would analyze pull output for updates"
+        log_dry_run "Container $container: If new images detected, would run: docker compose -f $found_compose_file down"
+        log_dry_run "Container $container: If new images detected, would run: docker compose -f $found_compose_file up -d"
+        log_dry_run "Container $container: If new images detected, would run: docker system prune -f"
     else
         log_info "Container $container: Pulling latest images..."
         if ! pull_output=$(lxc-attach -n "$container" -- sh -c "cd $COMPOSE_PATH && docker compose -f $found_compose_file pull" 2>&1); then
@@ -379,10 +514,12 @@ for container in $running_containers; do
 
         echo "$pull_output" | sed 's/^/  /'
 
-        # Check if any new images were pulled
-        # Docker Compose outputs "Downloading" when actually fetching new image layers
-        # When no updates: only shows "Pulling" and "Pulled" without any download activity
-        if echo "$pull_output" | grep -qiE "(Downloading|Downloaded newer image|Download complete)"; then
+        # Check if any new images were pulled.
+        # Docker Compose output format includes lines like:
+        #   "Status: Downloaded newer image for ..."
+        #   "Downloading ..."
+        # We match only lines from the pull command's status output, not arbitrary text.
+        if echo "$pull_output" | grep -qE '^\s*(Status:\s*(Downloaded newer image|Downloading|Download complete))'; then
             log_info "Container $container: New images detected, updating services..."
 
             # Stop the compose services
@@ -424,8 +561,8 @@ for container in $running_containers; do
             # Run post-update hook if specified
             if [ -n "$POST_UPDATE_HOOK" ] && [ "$DRY_RUN" = false ]; then
                 log_info "Container $container: Running post-update hook: $POST_UPDATE_HOOK"
-                if ! "$POST_UPDATE_HOOK" "$container" 2>/dev/null; then
-                    log_warn "Container $container: Post-update hook failed or returned non-zero"
+                if ! "$POST_UPDATE_HOOK" "$container"; then
+                    log_warn "Container $container: Post-update hook returned non-zero exit code (output above)"
                 fi
             elif [ -n "$POST_UPDATE_HOOK" ] && [ "$DRY_RUN" = true ]; then
                 log_dry_run "Container $container: Would run post-update hook: $POST_UPDATE_HOOK $container"
@@ -442,44 +579,5 @@ log_info "All containers processed"
 
 # Send final notification if configured
 if [ "$DRY_RUN" = false ] && ([ -n "$NOTIFY_EMAIL" ] || [ -n "$NOTIFY_WEBHOOK" ]); then
-    END_TIME=$(date +%s)
-    DURATION=$((END_TIME - START_TIME))
-    
-    local subject="Compose Updater: Update Process Completed"
-    local message="Compose Updater Update Summary\n\n"
-    message+="Start Time: $(date -d @$START_TIME '+%Y-%m-%d %H:%M:%S')\n"
-    message+="End Time: $(date -d @$END_TIME '+%Y-%m-%d %H:%M:%S')\n"
-    message+="Duration: ${DURATION} seconds\n\n"
-    
-    message+="Updated Containers: ${#UPDATED_CONTAINERS[@]}\n"
-    if [ ${#UPDATED_CONTAINERS[@]} -gt 0 ]; then
-        for container in "${UPDATED_CONTAINERS[@]}"; do
-            message+="  - $container\n"
-        done
-    fi
-    message+="\n"
-    
-    message+="Failed Containers: ${#FAILED_CONTAINERS[@]}\n"
-    if [ ${#FAILED_CONTAINERS[@]} -gt 0 ]; then
-        for container in "${FAILED_CONTAINERS[@]}"; do
-            message+="  - $container\n"
-        done
-    fi
-    message+="\n"
-    
-    message+="Skipped Containers: ${#SKIPPED_CONTAINERS[@]}\n"
-    if [ ${#SKIPPED_CONTAINERS[@]} -gt 0 ]; then
-        for container in "${SKIPPED_CONTAINERS[@]}"; do
-            message+="  - $container\n"
-        done
-    fi
-    
-    if [ ${#FAILED_CONTAINERS[@]} -gt 0 ]; then
-        subject="Compose Updater: Update Process Completed with Failures"
-        message+="\n\n⚠️  WARNING: Some containers failed during update process"
-    else
-        message+="\n\n✅ All containers processed successfully"
-    fi
-    
-    send_notification "$subject" "$message"
+    send_final_notification
 fi
