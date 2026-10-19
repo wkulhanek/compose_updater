@@ -26,7 +26,10 @@ PRE_UPDATE_HOOK=""
 POST_UPDATE_HOOK=""
 HEALTH_CHECK=true
 HEALTH_CHECK_TIMEOUT=30
-HEALTH_CHECK_RETRIES=3
+HEALTH_CHECK_RETRIES=10
+HEALTH_CHECK_INTERVAL=5
+PRUNE_ALL_IMAGES=false
+PRUNE_VOLUMES=false
 NOTIFY_EMAIL=""
 NOTIFY_WEBHOOK=""
 NOTIFY_SUMMARY_ONLY=false
@@ -109,6 +112,120 @@ array_length() {
     eval "echo \"\${#$name[@]:-$default}\""
 }
 
+# --- Helper: image tracking and cleanup ---
+
+# Return the image names referenced by a compose file, one per line
+get_compose_image_names() {
+    local container="$1"
+    local compose_file="$2"
+    local names
+
+    names=$(lxc-attach -n "$container" -- sh -c \
+        "cd $COMPOSE_PATH && docker compose -f $compose_file config --images 2>/dev/null" || true)
+
+    if [ -z "$names" ]; then
+        # Older Compose versions lack 'config --images'; parse the rendered config instead
+        names=$(lxc-attach -n "$container" -- sh -c \
+            "cd $COMPOSE_PATH && docker compose -f $compose_file config 2>/dev/null" || true)
+        names=$(printf '%s\n' "$names" | sed -n 's/^[[:space:]]*image:[[:space:]]*//p' | tr -d '"' | sort -u)
+    fi
+
+    printf '%s\n' "$names"
+}
+
+# Return the local image IDs for the images referenced by a compose file, one per line
+get_compose_image_ids() {
+    local container="$1"
+    local compose_file="$2"
+    local image
+
+    get_compose_image_names "$container" "$compose_file" | while IFS= read -r image; do
+        [ -z "$image" ] && continue
+        lxc-attach -n "$container" -- docker image inspect --format '{{.Id}}' "$image" 2>/dev/null || true
+    done | sort -u
+}
+
+# Return the image IDs actually used by the compose project's containers, one per line.
+# Falls back to the images referenced by the compose file when no containers exist.
+get_active_image_ids() {
+    local container="$1"
+    local compose_file="$2"
+    local ids
+
+    ids=$(lxc-attach -n "$container" -- sh -c \
+        "cd $COMPOSE_PATH && docker compose -f $compose_file ps -q 2>/dev/null |
+         while IFS= read -r cid; do
+             [ -n \"\$cid\" ] && docker inspect --format '{{.Image}}' \"\$cid\" 2>/dev/null
+         done" | sort -u || true)
+
+    if [ -z "$ids" ]; then
+        ids=$(get_compose_image_ids "$container" "$compose_file")
+    fi
+
+    printf '%s\n' "$ids"
+}
+
+# Remove images that were used before the update and are no longer referenced by the compose file
+cleanup_replaced_images() {
+    local container="$1"
+    local old_ids="$2"
+    local new_ids="$3"
+    local id
+
+    while IFS= read -r id; do
+        [ -z "$id" ] && continue
+
+        if printf '%s\n' "$new_ids" | grep -qxF "$id"; then
+            continue
+        fi
+
+        log_info "Container $container: Removing replaced image $id"
+        if ! lxc-attach -n "$container" -- docker image rm "$id" >/dev/null 2>&1; then
+            log_debug "Container $container: Image $id is still in use, keeping it"
+        fi
+    done <<< "$old_ids"
+}
+
+# Prune unused Docker resources inside a container
+prune_docker_resources() {
+    local container="$1"
+    local -a image_prune_args=(-f)
+
+    if [ "$PRUNE_ALL_IMAGES" = true ]; then
+        image_prune_args=(-a -f)
+    fi
+
+    log_info "Container $container: Pruning unused images..."
+    if ! lxc-attach -n "$container" -- docker image prune "${image_prune_args[@]}" 2>/dev/null; then
+        log_warn "Container $container: Failed to prune unused images"
+    fi
+
+    log_info "Container $container: Pruning stopped containers, unused networks and build cache..."
+    if ! lxc-attach -n "$container" -- docker system prune -f 2>/dev/null; then
+        log_warn "Container $container: Failed to prune Docker resources"
+    fi
+
+    if [ "$PRUNE_VOLUMES" = true ]; then
+        log_info "Container $container: Pruning unused volumes..."
+        if ! lxc-attach -n "$container" -- docker volume prune -f 2>/dev/null; then
+            log_warn "Container $container: Failed to prune unused volumes"
+        fi
+    fi
+}
+
+# Log Docker's disk usage so reclaimed space is visible in the run log
+log_docker_disk_usage() {
+    local container="$1"
+    local label="$2"
+    local usage
+
+    usage=$(lxc-attach -n "$container" -- docker system df 2>/dev/null || true)
+    if [ -n "$usage" ]; then
+        log_info "Container $container: Docker disk usage ($label):"
+        printf '%s\n' "$usage" | sed 's/^/  /'
+    fi
+}
+
 # --- Helper: lock file to prevent concurrent runs ---
 
 acquire_lock() {
@@ -138,7 +255,10 @@ show_help() {
     echo "  --post-hook SCRIPT       Run script after successful updates (passes container name as arg)"
     echo "  --no-health-check        Disable health checks after updates"
     echo "  --health-check-timeout SEC  Health check timeout in seconds (default: 30)"
-    echo "  --health-check-retries N   Number of health check retries (default: 3)"
+    echo "  --health-check-retries N   Number of health check retries (default: 10)"
+    echo "  --health-check-interval SEC  Seconds to wait between health check retries (default: 5)"
+    echo "  --prune-all-images       Remove all unused images, including tagged ones"
+    echo "  --prune-volumes          Remove unused volumes (destructive, opt-in only)"
     echo "  --notify-email ADDR       Send email notification to specified address"
     echo "  --notify-webhook URL      Send webhook notification to specified URL"
     echo "  --notify-summary-only     Only send summary notification (not per-container)"
@@ -194,6 +314,19 @@ while [[ $# -gt 0 ]]; do
             HEALTH_CHECK_RETRIES="$2"
             shift 2
             ;;
+        --health-check-interval)
+            validate_positive_integer "Health check interval" "$2"
+            HEALTH_CHECK_INTERVAL="$2"
+            shift 2
+            ;;
+        --prune-all-images)
+            PRUNE_ALL_IMAGES=true
+            shift
+            ;;
+        --prune-volumes)
+            PRUNE_VOLUMES=true
+            shift
+            ;;
         --notify-email)
             NOTIFY_EMAIL="$2"
             shift 2
@@ -212,7 +345,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             log_error "Unknown option: $1"
-            echo "Usage: $0 [--dry-run] [--compose-path PATH] [--compose-files FILE1,FILE2,...] [--filter PATTERN] [--help]"
+            echo "Usage: $0 [--dry-run] [--compose-path PATH] [--compose-files FILE1,FILE2,...] [--filter PATTERN] [--prune-all-images] [--prune-volumes] [--help]"
             exit 1
             ;;
     esac
@@ -249,56 +382,60 @@ check_container_health() {
     local compose_file="$2"
     local timeout="$3"
     local retries="$4"
-    
-    log_info "Container $container: Starting health check (timeout: ${timeout}s, retries: $retries)..."
-    
+    local interval="$5"
+
+    log_info "Container $container: Starting health check (timeout: ${timeout}s, retries: $retries, interval: ${interval}s)..."
+
     local attempt=1
     local healthy=false
-    
+
     while [ $attempt -le $retries ]; do
         log_info "Container $container: Health check attempt $attempt/$retries..."
-        
-        # Check if containers are running using docker compose ps
-        if lxc-attach -n "$container" -- sh -c "cd $COMPOSE_PATH && docker compose -f $compose_file ps --format json" 2>/dev/null | grep -q '"Running"'; then
+
+        local ps_output
+        ps_output=$(lxc-attach -n "$container" -- sh -c "cd $COMPOSE_PATH && timeout $timeout docker compose -f $compose_file ps --format json" 2>/dev/null || true)
+
+        # Compose v1 and v2 use different JSON fields for the running state
+        if printf '%s\n' "$ps_output" | grep -qE '"State"[[:space:]]*:[[:space:]]*"running"|"Running"[[:space:]]*:[[:space:]]*true|"Status"[[:space:]]*:[[:space:]]*"Up'; then
             log_info "Container $container: Services are running"
-            
-            # Check for healthy status if health checks are defined in the compose file
-            local raw_health
-            raw_health=$(lxc-attach -n "$container" -- sh -c "cd $COMPOSE_PATH && timeout $timeout docker compose -f $compose_file ps --format json" 2>/dev/null | grep -o '"Health":"[^"]*"' || true)
-            
-            if [ -n "$raw_health" ]; then
-                # Extract the health status value (e.g., "healthy", "unhealthy")
-                local status_value
-                status_value=$(echo "$raw_health" | sed 's/"Health":"\([^"]*\)"/\1/')
-                
-                if [ "$status_value" = "healthy" ]; then
-                    log_success "Container $container: Health check passed (status: $status_value)"
-                    healthy=true
-                    break
-                else
-                    log_warn "Container $container: Health check reports status: $status_value"
-                fi
-            else
-                # No health check defined in compose file — consider it healthy if running
+
+            # An empty "Health" field means no health check is defined for that service
+            local health_statuses
+            health_statuses=$(printf '%s\n' "$ps_output" \
+                | grep -oE '"Health"[[:space:]]*:[[:space:]]*"[^"]*"' \
+                | sed 's/.*:[[:space:]]*"\(.*\)"/\1/' \
+                | grep -v '^$' || true)
+
+            if [ -z "$health_statuses" ]; then
                 log_info "Container $container: No health check defined, but services are running"
+                healthy=true
+                break
+            elif printf '%s\n' "$health_statuses" | grep -qx 'unhealthy'; then
+                log_warn "Container $container: Health check reports status: unhealthy"
+            elif printf '%s\n' "$health_statuses" | grep -qx 'starting'; then
+                log_warn "Container $container: Health check reports status: starting"
+            else
+                log_success "Container $container: Health check passed (status: healthy)"
                 healthy=true
                 break
             fi
         else
-            log_warn "Container $container: Services not running, waiting..."
-            if [ $attempt -lt $retries ]; then
-                sleep 5
-            fi
+            log_warn "Container $container: Services not running yet..."
         fi
-        
+
+        if [ $attempt -lt $retries ]; then
+            log_info "Container $container: Waiting ${interval}s before next attempt..."
+            sleep "$interval"
+        fi
+
         attempt=$((attempt + 1))
     done
-    
+
     if [ "$healthy" = false ]; then
         log_error "Container $container: Health check failed after $retries attempts"
         return 1
     fi
-    
+
     return 0
 }
 
@@ -499,12 +636,25 @@ for container in $running_containers; do
 
     # Pull latest images and capture output
     if [ "$DRY_RUN" = true ]; then
+        log_dry_run "Container $container: Would record image IDs currently used by the compose project"
         log_dry_run "Container $container: Would run: docker compose -f $found_compose_file pull"
-        log_dry_run "Container $container: Would analyze pull output for updates"
+        log_dry_run "Container $container: Would compare image IDs before and after the pull to detect updates"
         log_dry_run "Container $container: If new images detected, would run: docker compose -f $found_compose_file down"
         log_dry_run "Container $container: If new images detected, would run: docker compose -f $found_compose_file up -d"
-        log_dry_run "Container $container: If new images detected, would run: docker system prune -f"
+        log_dry_run "Container $container: If new images detected, would remove replaced images"
+        if [ "$PRUNE_ALL_IMAGES" = true ]; then
+            log_dry_run "Container $container: Would run: docker image prune -a -f"
+        else
+            log_dry_run "Container $container: Would run: docker image prune -f"
+        fi
+        log_dry_run "Container $container: Would run: docker system prune -f"
+        if [ "$PRUNE_VOLUMES" = true ]; then
+            log_dry_run "Container $container: Would run: docker volume prune -f"
+        fi
     else
+        old_image_ids=$(get_active_image_ids "$container" "$found_compose_file")
+        log_docker_disk_usage "$container" "before update"
+
         log_info "Container $container: Pulling latest images..."
         if ! pull_output=$(lxc-attach -n "$container" -- sh -c "cd $COMPOSE_PATH && docker compose -f $found_compose_file pull" 2>&1); then
             log_error "Container $container: Failed to pull images"
@@ -514,12 +664,21 @@ for container in $running_containers; do
 
         echo "$pull_output" | sed 's/^/  /'
 
-        # Check if any new images were pulled.
-        # Docker Compose output format includes lines like:
-        #   "Status: Downloaded newer image for ..."
-        #   "Downloading ..."
-        # We match only lines from the pull command's status output, not arbitrary text.
-        if echo "$pull_output" | grep -qE '^\s*(Status:\s*(Downloaded newer image|Downloading|Download complete))'; then
+        # Compare the image IDs used by the running project with the IDs the
+        # compose file now resolves to. This is independent of Compose output
+        # formatting and also recovers from earlier runs that pulled a new
+        # image but never restarted the services.
+        new_image_ids=$(get_compose_image_ids "$container" "$found_compose_file")
+
+        images_changed=false
+        if [ "$old_image_ids" != "$new_image_ids" ]; then
+            images_changed=true
+        elif echo "$pull_output" | grep -qE '^\s*(Status:\s*(Downloaded newer image|Downloading|Download complete))'; then
+            # Fallback for when image IDs could not be resolved
+            images_changed=true
+        fi
+
+        if [ "$images_changed" = true ]; then
             log_info "Container $container: New images detected, updating services..."
 
             # Stop the compose services
@@ -536,28 +695,33 @@ for container in $running_containers; do
                 continue
             fi
 
-            # Clean up unused Docker resources
-            log_info "Container $container: Cleaning up unused Docker resources..."
-            if ! lxc-attach -n "$container" -- docker system prune -f 2>/dev/null; then
-                log_warn "Container $container: Failed to clean up Docker resources"
-            fi
-
             log_success "Container $container: Update complete"
-            
+
             # Run health check if enabled
             if [ "$HEALTH_CHECK" = true ] && [ "$DRY_RUN" = false ]; then
-                if check_container_health "$container" "$found_compose_file" "$HEALTH_CHECK_TIMEOUT" "$HEALTH_CHECK_RETRIES"; then
+                if check_container_health "$container" "$found_compose_file" "$HEALTH_CHECK_TIMEOUT" "$HEALTH_CHECK_RETRIES" "$HEALTH_CHECK_INTERVAL"; then
                     log_success "Container $container: Health check completed successfully"
                     UPDATED_CONTAINERS+=("$container")
                 else
                     log_error "Container $container: Health check failed"
                     FAILED_CONTAINERS+=("$container")
+                    # Keep the previous images available for rollback
                     continue
                 fi
             elif [ "$HEALTH_CHECK" = true ] && [ "$DRY_RUN" = true ]; then
-                log_dry_run "Container $container: Would perform health check (timeout: ${HEALTH_CHECK_TIMEOUT}s, retries: $HEALTH_CHECK_RETRIES)"
+                log_dry_run "Container $container: Would perform health check (timeout: ${HEALTH_CHECK_TIMEOUT}s, retries: $HEALTH_CHECK_RETRIES, interval: ${HEALTH_CHECK_INTERVAL}s)"
             fi
-            
+
+            # Clean up images replaced by this update. Only remove images that
+            # are no longer used by any container; 'docker image rm' refuses
+            # otherwise, so other compose projects are never affected.
+            log_info "Container $container: Cleaning up replaced images..."
+            current_image_ids=$(get_active_image_ids "$container" "$found_compose_file")
+            cleanup_replaced_images "$container" "$old_image_ids" "$current_image_ids"
+
+            prune_docker_resources "$container"
+            log_docker_disk_usage "$container" "after update"
+
             # Run post-update hook if specified
             if [ -n "$POST_UPDATE_HOOK" ] && [ "$DRY_RUN" = false ]; then
                 log_info "Container $container: Running post-update hook: $POST_UPDATE_HOOK"
@@ -569,6 +733,13 @@ for container in $running_containers; do
             fi
         else
             log_info "Container $container: No new images available, skipping update"
+
+            # Sweep dangling images left behind by earlier runs even when no
+            # update is detected. Tagged images are left alone here.
+            log_info "Container $container: Pruning dangling images..."
+            if ! lxc-attach -n "$container" -- docker image prune -f 2>/dev/null; then
+                log_warn "Container $container: Failed to prune dangling images"
+            fi
         fi
     fi
 

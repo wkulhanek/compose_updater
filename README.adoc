@@ -17,7 +17,7 @@ toc::[]
 * *Smart Updates*: Only restarts services when new images are actually pulled
 * *Safe Operation*: Dry-run mode for testing without making changes
 * *Colored Logging*: Clear, color-coded output for easy monitoring
-* *Resource Cleanup*: Automatically prunes unused Docker resources after updates
+* *Resource Cleanup*: Removes replaced images and prunes unused Docker resources after updates
 * *Error Handling*: Strict error checking with `set -euo pipefail`
 * *Concurrent Run Prevention*: Lock file prevents overlapping executions
 * *Hook Validation*: Pre/post hooks are validated for existence and executability before execution
@@ -174,7 +174,16 @@ Dry-run mode will:
 |Health check timeout in seconds (default: 30)
 
 |`--health-check-retries N`
-|Number of health check retries (default: 3)
+|Number of health check retries (default: 10)
+
+|`--health-check-interval SEC`
+|Seconds to wait between health check retries (default: 5)
+
+|`--prune-all-images`
+|Remove all unused images, including tagged ones (default: only dangling images)
+
+|`--prune-volumes`
+|Remove unused volumes (destructive, opt-in only)
 
 |`--notify-email ADDR`
 |Send email notification to specified address
@@ -202,14 +211,18 @@ The script follows this process for each running LXC container:
    - Skips containers without Docker Compose files
 
 3. *Update Phase*
+   - Records the image IDs currently used by the project's containers
    - Runs `docker compose pull` to fetch latest images
-   - Analyzes output to detect if new images were pulled
+   - Compares image IDs to detect if new images were pulled
    - If new images detected:
      * Runs `docker compose down` to stop services
      * Runs `docker compose up -d` to start with new images
-     * Runs `docker system prune -f` to clean up old images
+     * Runs a health check (when enabled) and keeps the old images for rollback if it fails
+     * Removes the replaced images that are no longer used by any container
+     * Runs `docker image prune -f` and `docker system prune -f` to clean up dangling images, stopped containers, networks and build cache
    - If no new images:
      * Skips restart to avoid unnecessary downtime
+     * Still sweeps dangling images left behind by earlier runs
 
 4. *Cleanup Phase*
    - Reports completion status for each container
@@ -222,12 +235,24 @@ The script follows this process for each running LXC container:
 
 === Detection Logic
 
-The script determines if updates are needed by analyzing `docker compose pull` output for status lines:
+The script determines if updates are needed by comparing image IDs rather than parsing pull output:
 
-* `Status: Downloaded newer image` - indicates a complete image was pulled
-* `Status: Downloading` or `Status: Download complete` - indicates new layers were fetched
+* Before pulling, it records the image IDs used by the compose project's containers
+* After pulling, it resolves the image IDs the compose file now points to
+* If the sets differ, services are restarted with the new images
 
-If no status line matching these patterns is found, the script assumes images are up-to-date and skips the restart. This prevents false positives from unrelated log output.
+This works with both Docker Compose v1 and v2 output formats, and also recovers from earlier runs that pulled a new image but never restarted the services. Legacy `Status: Downloaded newer image` output is still recognized as a fallback.
+
+=== Image Cleanup
+
+`docker system prune -f` alone only removes *dangling* (untagged) images, so old images that still carry a tag can accumulate and fill the disk. The script therefore:
+
+* Removes the specific image IDs that were replaced by the update, once the new deployment has passed its health check
+* Relies on `docker image rm` to refuse removal of images still used by any container, so other compose projects are never affected
+* Sweeps dangling images on every run, even when no update was detected
+* Optionally prunes all unused tagged images with `--prune-all-images`
+* Optionally prunes unused volumes with `--prune-volumes` (destructive)
+* Logs `docker system df` before and after updates so reclaimed space is visible
 
 === Multiple Compose Files
 
@@ -378,7 +403,8 @@ The script includes automatic health check verification after successful updates
 
 * *Automatic Verification*: Enabled by default with `--no-health-check` to disable
 * *Configurable Timeout*: Adjustable timeout period for service startup
-* *Multiple Retries*: Configurable number of retry attempts
+* *Multiple Retries*: Configurable number of retry attempts (default 10)
+* *Configurable Interval*: Adjustable wait between attempts via `--health-check-interval`
 * *Detailed Logging*: Clear status messages for each health check attempt
 * *Graceful Failure*: Continues processing other containers if health check fails
 
@@ -406,7 +432,11 @@ The script includes automatic health check verification after successful updates
 
 |`--health-check-retries N`
 |Number of attempts to verify service health
-|3 attempts
+|10 attempts
+
+|`--health-check-interval SEC`
+|Seconds to wait between attempts
+|5 seconds
 
 |===
 
@@ -421,7 +451,8 @@ The script includes automatic health check verification after successful updates
 === Health Check Best Practices
 
 1. *Adjust timeout for slow services*: Increase `--health-check-timeout` for services like databases
-2. *Balance retries and speed*: More retries increase reliability but slow down the process
+2. *Balance retries and speed*: More retries increase reliability but slow down the process; the default is 10 attempts with a 5 second interval
+3. *Tune the interval*: Use `--health-check-interval` to wait longer between attempts for very slow starts
 3. *Monitor health check failures*: Use post-update hooks to notify about failed health checks
 4. *Test health checks in dry-run*: Verify health check behavior before live execution
 5. *Consider disabling for non-critical updates*: Use `--no-health-check` for faster updates when appropriate
@@ -431,11 +462,11 @@ The script includes automatic health check verification after successful updates
 
 [source,bash]
 ----
-# Default health check (enabled, 30s timeout, 3 retries)
+# Default health check (enabled, 30s timeout, 10 retries, 5s interval)
 ./compose_updater.sh
 
 # Custom health check settings for slow services
-./compose_updater.sh --health-check-timeout 120 --health-check-retries 5
+./compose_updater.sh --health-check-timeout 120 --health-check-retries 20 --health-check-interval 10
 
 # Disable health checks for faster updates (not recommended for production)
 ./compose_updater.sh --no-health-check
@@ -447,7 +478,7 @@ The script includes automatic health check verification after successful updates
 ./compose_updater.sh --notify-email admin@example.com --notify-webhook https://webhook.example.com/alert
 
 # Dry-run to test health check behavior
-./compose_updater.sh --dry-run --health-check-timeout 30 --health-check-retries 3
+./compose_updater.sh --dry-run --health-check-timeout 30 --health-check-retries 10
 
 # Complete example with all features
 ./compose_updater.sh --filter "production-.*" --pre-hook ./backup.sh --health-check-timeout 60 --notify-email team@example.com
@@ -473,7 +504,8 @@ The script includes automatic health check verification after successful updates
 *Solutions*:
 
 * Increase timeout with `--health-check-timeout 60` or higher
-* Increase retries with `--health-check-retries 5`
+* Increase retries with `--health-check-retries 20`
+* Increase the wait between attempts with `--health-check-interval 10`
 * Check if services are actually starting (may need resource adjustments)
 * Review service dependencies and startup order
 
@@ -654,8 +686,12 @@ The notification includes:
 [INFO] Container nginx-proxy: New images detected, updating services...
 [INFO] Container nginx-proxy: Stopping services...
 [INFO] Container nginx-proxy: Starting services...
-[INFO] Container nginx-proxy: Cleaning up unused Docker resources...
 [INFO] Container nginx-proxy: Update complete
+[INFO] Container nginx-proxy: Cleaning up replaced images...
+[INFO] Container nginx-proxy: Removing replaced image sha256:...
+[INFO] Container nginx-proxy: Pruning unused images...
+[INFO] Container nginx-proxy: Pruning stopped containers, unused networks and build cache...
+[INFO] Container nginx-proxy: Docker disk usage (after update):
 
 [INFO] Processing container: monitoring
 [WARN] Container monitoring: No /root/docker-compose.yml found, skipping
@@ -679,11 +715,14 @@ The notification includes:
 
 [INFO] Processing container: nginx-proxy
 [INFO] Container nginx-proxy: Found docker-compose.yml
-[DRY-RUN] Container nginx-proxy: Would run: docker compose pull
-[DRY-RUN] Container nginx-proxy: Would analyze pull output for updates
+[DRY-RUN] Container nginx-proxy: Would record image IDs currently used by the compose project
+[DRY-RUN] Container nginx-proxy: Would run: docker compose -f $found_compose_file pull
+[DRY-RUN] Container nginx-proxy: Would compare image IDs before and after the pull to detect updates
 [DRY-RUN] Container nginx-proxy: If new images detected, would run: docker compose -f $found_compose_file down
 [DRY-RUN] Container nginx-proxy: If new images detected, would run: docker compose -f $found_compose_file up -d
-[DRY-RUN] Container nginx-proxy: If new images detected, would run: docker system prune -f
+[DRY-RUN] Container nginx-proxy: If new images detected, would remove replaced images
+[DRY-RUN] Container nginx-proxy: Would run: docker image prune -f
+[DRY-RUN] Container nginx-proxy: Would run: docker system prune -f
 
 [INFO] All containers processed
 ----
@@ -939,6 +978,18 @@ lxc-attach -n "$container" -- sh -c 'cd /root && docker compose down'
 [Add support/contact information here]
 
 == Changelog
+
+=== Version 2.1.0
+
+* *Robust update detection*: Compares image IDs before and after `docker compose pull` instead of parsing Compose v1 output, fixing missed updates on Compose v2
+* *Replaced image cleanup*: Removes old image IDs after a successful update, including tagged images that `docker system prune` leaves behind
+* *Rollback safety*: Old images are only removed after the health check passes
+* *Dangling image sweep*: Prunes dangling images on every run, even when no update is detected
+* *New `--prune-all-images`*: Opt-in removal of all unused tagged images
+* *New `--prune-volumes`*: Opt-in removal of unused volumes
+* *Health check fixes*: Detects the running state in both Compose v1 and v2 JSON output, treats empty/absent health checks as healthy, and supports `--health-check-interval`
+* *Higher health check retries*: Default is now 10 attempts at 5 second intervals for slow-starting services
+* *Disk usage logging*: Logs `docker system df` before and after updates
 
 === Version 2.0.0
 
